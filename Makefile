@@ -1,4 +1,4 @@
-docker: build
+docker:
 	docker build -t neumayer/dbwebapp .
 
 build:
