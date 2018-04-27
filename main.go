@@ -2,13 +2,11 @@ package main
 
 import (
 	"database/sql"
+	"flag"
 	"log"
 	"net/http"
 	"os"
 	"strings"
-	"time"
-
-	"flag"
 
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -36,9 +34,13 @@ func parseStringEnv(flagName string) string {
 func main() {
 	dbHost := flag.String("dbHost", "localhost", "Db host to connect to.")
 	dbName := flag.String("dbName", "", "Db to use.")
-	dbUser := flag.String("dbUser", "", "Db user to connect with.")
-	dbPass := flag.String("dbPass", "", "Db password to connect with.")
+	dbUser := flag.String("dbUser", "", "Db user to connect with. Requires dbPass. Takes precedence over vault methods")
+	dbPass := flag.String("dbPass", "", "Db password to connect with. Requires dbUser. Takes precedence over vault methods")
 	dbPort := flag.String("dbPort", "3306", "Db port to connect to.")
+	vaultToken := flag.String("vaultToken", "", "Token to access vault with. Takes precedence over vaultRoleId and vaultSecredId.")
+	vaultRoleID := flag.String("vaultRoleId", "", "Role ID to access vault with. Requires vaultSecretId.")
+	vaultSecretID := flag.String("vaultSecretId", "", "Secret ID to access vault with. Requires vaultRoleId.")
+	vaultAddr := flag.String("vaultAddr", "http://localhost:8200", "Vault address to use.")
 	flag.Parse()
 	envDbHost := parseStringEnv("dbHost")
 	if envDbHost != "" {
@@ -61,7 +63,45 @@ func main() {
 		dbPort = &envDbPort
 	}
 
+	envVaultToken := parseStringEnv("vaultToken")
+	if envVaultToken != "" {
+		vaultToken = &envVaultToken
+	}
+
+	envVaultSecretID := parseStringEnv("vaultSecretID")
+	if envVaultSecretID != "" {
+		vaultSecretID = &envVaultSecretID
+	}
+
+	envVaultRoleID := parseStringEnv("vaultRoleId")
+	if envVaultRoleID != "" {
+		vaultRoleID = &envVaultRoleID
+	}
+
+	envVaultAddr := parseStringEnv("vaultAddr")
+	if envVaultAddr != "" {
+		vaultAddr = &envVaultAddr
+	}
+
 	log.Println("Initialising dbwebapp.")
+	errChan := make(chan error)
+
+	// get db credentials
+	if *dbUser == "" && *dbPass == "" && (*vaultToken != "" || (*vaultRoleID != "" && *vaultSecretID != "")) {
+		vaultClient, err := newVaultClient(*vaultAddr)
+		*dbUser, *dbPass, err = vaultClient.getCredentials(*vaultAddr, *vaultToken, *vaultRoleID, *vaultSecretID)
+		if err != nil {
+			log.Fatal(err)
+		}
+		go func() {
+			errChan <- vaultClient.regularlyRenewLease()
+		}()
+	}
+	if *dbUser == "" || *dbPass == "" {
+		log.Fatal("No database credentials given (neither via environment, command line, or vault)")
+	}
+
+	// set up db
 	userAndPass := *dbUser + ":" + *dbPass
 	log.Println("Connecting to " + *dbUser + ":xxxx" + "@tcp(" + *dbHost + ":" + *dbPort + ")/" + *dbName)
 	db, err := sql.Open("mysql", userAndPass+"@tcp("+*dbHost+":"+*dbPort+")/"+*dbName)
@@ -69,24 +109,20 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
+	pingExternalService(*dbHost, &dbPinger{db})
 
-	numBackOffIterations := 15
-	for i := 1; i <= numBackOffIterations; i++ {
-		log.Printf("Pinging db %s.\n", *dbHost)
-		err = db.Ping()
-		if err == nil {
-			log.Println("Connected to db.")
-			break
-		}
-		waitDuration := time.Duration(i) * time.Second
-		log.Printf("Backing off for %s.\n", waitDuration)
-		time.Sleep(waitDuration)
-		if i == numBackOffIterations {
-			log.Printf("Error connecting to db %s, %s. Exiting.", *dbHost, err)
-			os.Exit(1)
-		}
-	}
+	// start http server
 	log.Println("Starting dbwebapp server.")
 	http.HandleFunc("/health", healthHandler)
-	http.ListenAndServe("0.0.0.0:8080", nil)
+	go func() {
+		errChan <- http.ListenAndServe("0.0.0.0:8081", nil)
+	}()
+	for {
+		select {
+		case err := <-errChan:
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+	}
 }
