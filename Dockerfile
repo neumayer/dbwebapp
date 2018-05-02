@@ -1,4 +1,4 @@
-FROM golang
+FROM golang:alpine
 WORKDIR /go/src/github.com/neumayer/dbwebapp/
 COPY vendor vendor
 COPY main.go .
