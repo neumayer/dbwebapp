@@ -109,7 +109,10 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
-	pingExternalService(*dbHost, &dbPinger{db})
+	err = pingExternalService(*dbHost, &dbPinger{db})
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	// start http server
 	log.Println("Starting dbwebapp server.")
